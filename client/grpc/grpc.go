@@ -19,10 +19,10 @@ import (
 	"github.com/micro/go-micro/selector"
 	"github.com/micro/go-micro/transport"
 
-	"github.com/micro/grpc-go"
-	"github.com/micro/grpc-go/credentials"
-	"github.com/micro/grpc-go/encoding"
-	gmetadata "github.com/micro/grpc-go/metadata"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/encoding"
+	gmetadata "google.golang.org/grpc/metadata"
 )
 
 type grpcClient struct {
@@ -71,7 +71,12 @@ func (g *grpcClient) next(request client.Request, opts client.CallOptions) (sele
 	return next, nil
 }
 
-func (g *grpcClient) call(ctx context.Context, address string, req client.Request, rsp interface{}, opts client.CallOptions) error {
+func (g *grpcClient) call(ctx context.Context, node *registry.Node, req client.Request, rsp interface{}, opts client.CallOptions) error {
+	address := node.Address
+	if node.Port > 0 {
+		address = fmt.Sprintf("%s:%d", address, node.Port)
+	}
+
 	header := make(map[string]string)
 	if md, ok := metadata.FromContext(ctx); ok {
 		for k, v := range md {
@@ -114,7 +119,7 @@ func (g *grpcClient) call(ctx context.Context, address string, req client.Reques
 	ch := make(chan error, 1)
 
 	go func() {
-		err := cc.Invoke(ctx, methodToGRPC(req.Endpoint(), req.Body()), req.Body(), rsp, grpc.CallContentSubtype(cf.Name()))
+		err := cc.Invoke(ctx, methodToGRPC(req.Endpoint(), req.Body()), req.Body(), rsp, grpc.CallContentSubtype(cf.String()))
 		ch <- microError(err)
 	}()
 
@@ -128,7 +133,12 @@ func (g *grpcClient) call(ctx context.Context, address string, req client.Reques
 	return grr
 }
 
-func (g *grpcClient) stream(ctx context.Context, address string, req client.Request, opts client.CallOptions) (client.Stream, error) {
+func (g *grpcClient) stream(ctx context.Context, node *registry.Node, req client.Request, opts client.CallOptions) (client.Stream, error) {
+	address := node.Address
+	if node.Port > 0 {
+		address = fmt.Sprintf("%s:%d", address, node.Port)
+	}
+
 	header := make(map[string]string)
 	if md, ok := metadata.FromContext(ctx); ok {
 		for k, v := range md {
@@ -168,7 +178,7 @@ func (g *grpcClient) stream(ctx context.Context, address string, req client.Requ
 		ServerStreams: true,
 	}
 
-	st, err := cc.NewStream(ctx, desc, methodToGRPC(req.Endpoint(), req.Body()), grpc.CallContentSubtype(cf.Name()))
+	st, err := cc.NewStream(ctx, desc, methodToGRPC(req.Endpoint(), req.Body()), grpc.CallContentSubtype(cf.String()))
 	if err != nil {
 		return nil, errors.InternalServerError("go.micro.client", fmt.Sprintf("Error creating stream: %v", err))
 	}
@@ -203,7 +213,7 @@ func (g *grpcClient) maxSendMsgSizeValue() int {
 	return v.(int)
 }
 
-func (g *grpcClient) newGRPCCodec(contentType string) (encoding.Codec, error) {
+func (g *grpcClient) newGRPCCodec(contentType string) (grpc.Codec, error) {
 	codecs := make(map[string]encoding.Codec)
 	if g.opts.Context != nil {
 		if v := g.opts.Context.Value(codecsKey{}); v != nil {
@@ -211,10 +221,10 @@ func (g *grpcClient) newGRPCCodec(contentType string) (encoding.Codec, error) {
 		}
 	}
 	if c, ok := codecs[contentType]; ok {
-		return c, nil
+		return wrapCodec{c}, nil
 	}
 	if c, ok := defaultGRPCCodecs[contentType]; ok {
-		return c, nil
+		return wrapCodec{c}, nil
 	}
 	return nil, fmt.Errorf("Unsupported Content-Type: %s", contentType)
 }
@@ -320,14 +330,8 @@ func (g *grpcClient) Call(ctx context.Context, req client.Request, rsp interface
 			return errors.InternalServerError("go.micro.client", err.Error())
 		}
 
-		// set the address
-		addr := node.Address
-		if node.Port > 0 {
-			addr = fmt.Sprintf("%s:%d", addr, node.Port)
-		}
-
 		// make the call
-		err = gcall(ctx, addr, req, rsp, callOpts)
+		err = gcall(ctx, node, req, rsp, callOpts)
 		g.opts.Selector.Mark(req.Service(), node, err)
 		return err
 	}
@@ -405,12 +409,7 @@ func (g *grpcClient) Stream(ctx context.Context, req client.Request, opts ...cli
 			return nil, errors.InternalServerError("go.micro.client", err.Error())
 		}
 
-		addr := node.Address
-		if node.Port > 0 {
-			addr = fmt.Sprintf("%s:%d", addr, node.Port)
-		}
-
-		stream, err := g.stream(ctx, addr, req, callOpts)
+		stream, err := g.stream(ctx, node, req, callOpts)
 		g.opts.Selector.Mark(req.Service(), node, err)
 		return stream, err
 	}

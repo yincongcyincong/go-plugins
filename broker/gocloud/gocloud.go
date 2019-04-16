@@ -89,10 +89,10 @@ func setupGCP(ctx context.Context, projectID gcp.ProjectID, ts gcp.TokenSource) 
 		return nil, nil, err
 	}
 	return func(name string) *pubsub.Topic {
-			return gcppubsub.OpenTopic(ctx, pc, projectID, name, nil)
+			return gcppubsub.OpenTopic(pc, projectID, name, nil)
 		},
 		func(t *pubsub.Topic, name string) *pubsub.Subscription {
-			return gcppubsub.OpenSubscription(ctx, sc, projectID, name, nil)
+			return gcppubsub.OpenSubscription(sc, projectID, name, nil)
 		},
 		nil
 }
@@ -102,9 +102,9 @@ func setupRabbit(ctx context.Context, url string) (topicOpener, subOpener, error
 	if err != nil {
 		return nil, nil, err
 	}
-	return func(name string) *pubsub.Topic { return rabbitpubsub.OpenTopic(conn, name) },
+	return func(name string) *pubsub.Topic { return rabbitpubsub.OpenTopic(conn, name, nil) },
 		func(_ *pubsub.Topic, name string) *pubsub.Subscription {
-			return rabbitpubsub.OpenSubscription(conn, name)
+			return rabbitpubsub.OpenSubscription(conn, name, nil)
 		},
 		nil
 }

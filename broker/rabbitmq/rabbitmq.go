@@ -29,6 +29,7 @@ type subscriber struct {
 	topic        string
 	ch           *rabbitMQChannel
 	durableQueue bool
+	queueArgs    map[string]interface{}
 	r            *rbroker
 	fn           func(msg amqp.Delivery)
 	headers      map[string]interface{}
@@ -109,6 +110,7 @@ func (s *subscriber) resubscribe() {
 			s.opts.Queue,
 			s.topic,
 			s.headers,
+			s.queueArgs,
 			s.opts.AutoAck,
 			s.durableQueue,
 		)
@@ -163,10 +165,16 @@ func (r *rbroker) Publish(topic string, msg *broker.Message, opts ...broker.Publ
 		return errors.New("connection is nil")
 	}
 
-	return r.conn.Publish(r.conn.exchange, topic, m)
+	return r.conn.Publish(r.conn.exchange.name, topic, m)
 }
 
 func (r *rbroker) Subscribe(topic string, handler broker.Handler, opts ...broker.SubscribeOption) (broker.Subscriber, error) {
+	var ackSuccess bool
+
+	if r.conn == nil {
+		return nil, errors.New("not connected")
+	}
+
 	opt := broker.SubscribeOptions{
 		AutoAck: true,
 	}
@@ -175,25 +183,35 @@ func (r *rbroker) Subscribe(topic string, handler broker.Handler, opts ...broker
 		o(&opt)
 	}
 
-	requeueOnError := false
-	if opt.Context != nil {
-		requeueOnError, _ = opt.Context.Value(requeueOnErrorKey{}).(bool)
+	// Make sure context is setup
+	if opt.Context == nil {
+		opt.Context = context.Background()
 	}
 
+	ctx := opt.Context
+	if subscribeContext, ok := ctx.Value(subscribeContextKey{}).(context.Context); ok && subscribeContext != nil {
+		ctx = subscribeContext
+	}
+
+	requeueOnError := false
+	requeueOnError, _ = ctx.Value(requeueOnErrorKey{}).(bool)
+
 	durableQueue := false
-	if opt.Context != nil {
-		durableQueue, _ = opt.Context.Value(durableQueueKey{}).(bool)
+	durableQueue, _ = ctx.Value(durableQueueKey{}).(bool)
+
+	var qArgs map[string]interface{}
+	if qa, ok := ctx.Value(queueArgumentsKey{}).(map[string]interface{}); ok {
+		qArgs = qa
 	}
 
 	var headers map[string]interface{}
-	if opt.Context != nil {
-		if h, ok := opt.Context.Value(headersKey{}).(map[string]interface{}); ok {
-			headers = h
-		}
+	if h, ok := ctx.Value(headersKey{}).(map[string]interface{}); ok {
+		headers = h
 	}
 
-	if r.conn == nil {
-		return nil, errors.New("connection is nil")
+	if bval, ok := ctx.Value(ackSuccessKey{}).(bool); ok && bval {
+		opt.AutoAck = false
+		ackSuccess = true
 	}
 
 	fn := func(msg amqp.Delivery) {
@@ -205,13 +223,16 @@ func (r *rbroker) Subscribe(topic string, handler broker.Handler, opts ...broker
 			Header: header,
 			Body:   msg.Body,
 		}
-		if err := handler(&publication{d: msg, m: m, t: msg.RoutingKey}); err != nil && !opt.AutoAck {
+		err := handler(&publication{d: msg, m: m, t: msg.RoutingKey})
+		if err == nil && ackSuccess && !opt.AutoAck {
+			msg.Ack(false)
+		} else if err != nil && !opt.AutoAck {
 			msg.Nack(false, requeueOnError)
 		}
 	}
 
 	sret := &subscriber{topic: topic, opts: opt, mayRun: true, r: r,
-		durableQueue: durableQueue, fn: fn, headers: headers}
+		durableQueue: durableQueue, fn: fn, headers: headers, queueArgs: qArgs}
 
 	go sret.resubscribe()
 
@@ -245,7 +266,16 @@ func (r *rbroker) Connect() error {
 	if r.conn == nil {
 		r.conn = newRabbitMQConn(r.getExchange(), r.opts.Addrs, r.getPrefetchCount(), r.getPrefetchGlobal())
 	}
-	return r.conn.Connect(r.opts.Secure, r.opts.TLSConfig)
+
+	conf := defaultAmqpConfig
+
+	if auth, ok := r.opts.Context.Value(externalAuth{}).(ExternalAuthentication); ok {
+		conf.SASL = []amqp.Authentication{&auth}
+	}
+
+	conf.TLSClientConfig = r.opts.TLSConfig
+
+	return r.conn.Connect(r.opts.Secure, &conf)
 }
 
 func (r *rbroker) Disconnect() error {
@@ -272,11 +302,19 @@ func NewBroker(opts ...broker.Option) broker.Broker {
 	}
 }
 
-func (r *rbroker) getExchange() string {
+func (r *rbroker) getExchange() exchange {
+
+	ex := DefaultExchange
+
 	if e, ok := r.opts.Context.Value(exchangeKey{}).(string); ok {
-		return e
+		ex.name = e
 	}
-	return DefaultExchange
+
+	if d, ok := r.opts.Context.Value(durableExchange{}).(bool); ok {
+		ex.durable = d
+	}
+
+	return ex
 }
 
 func (r *rbroker) getPrefetchCount() int {

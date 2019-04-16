@@ -15,21 +15,35 @@ import (
 )
 
 var (
-	DefaultExchange       = "micro"
+	DefaultExchange = exchange{
+		name: "micro",
+	}
 	DefaultRabbitURL      = "amqp://guest:guest@127.0.0.1:5672"
 	DefaultPrefetchCount  = 0
 	DefaultPrefetchGlobal = false
 	DefaultRequeueOnError = false
 
-	dial    = amqp.Dial
-	dialTLS = amqp.DialTLS
+	// The amqp library does not seem to set these when using amqp.DialConfig
+	// (even though it says so in the comments) so we set them manually to make
+	// sure to not brake any existing functionality
+	defaultHeartbeat = 10 * time.Second
+	defaultLocale    = "en_US"
+
+	defaultAmqpConfig = amqp.Config{
+		Heartbeat: defaultHeartbeat,
+		Locale:    defaultLocale,
+	}
+
+	dial       = amqp.Dial
+	dialTLS    = amqp.DialTLS
+	dialConfig = amqp.DialConfig
 )
 
 type rabbitMQConn struct {
 	Connection      *amqp.Connection
 	Channel         *rabbitMQChannel
 	ExchangeChannel *rabbitMQChannel
-	exchange        string
+	exchange        exchange
 	url             string
 	prefetchCount   int
 	prefetchGlobal  bool
@@ -41,7 +55,12 @@ type rabbitMQConn struct {
 	waitConnection chan struct{}
 }
 
-func newRabbitMQConn(exchange string, urls []string, prefetchCount int, prefetchGlobal bool) *rabbitMQConn {
+type exchange struct {
+	name    string
+	durable bool
+}
+
+func newRabbitMQConn(ex exchange, urls []string, prefetchCount int, prefetchGlobal bool) *rabbitMQConn {
 	var url string
 
 	if len(urls) > 0 && regexp.MustCompile("^amqp(s)?://.*").MatchString(urls[0]) {
@@ -50,12 +69,12 @@ func newRabbitMQConn(exchange string, urls []string, prefetchCount int, prefetch
 		url = DefaultRabbitURL
 	}
 
-	if len(exchange) == 0 {
-		exchange = DefaultExchange
+	if len(ex.name) == 0 {
+		ex = DefaultExchange
 	}
 
 	ret := &rabbitMQConn{
-		exchange:       exchange,
+		exchange:       ex,
 		url:            url,
 		prefetchCount:  prefetchCount,
 		prefetchGlobal: prefetchGlobal,
@@ -67,7 +86,7 @@ func newRabbitMQConn(exchange string, urls []string, prefetchCount int, prefetch
 	return ret
 }
 
-func (r *rabbitMQConn) connect(secure bool, config *tls.Config) error {
+func (r *rabbitMQConn) connect(secure bool, config *amqp.Config) error {
 	// try connect
 	if err := r.tryConnect(secure, config); err != nil {
 		return err
@@ -83,7 +102,7 @@ func (r *rabbitMQConn) connect(secure bool, config *tls.Config) error {
 	return nil
 }
 
-func (r *rabbitMQConn) reconnect(secure bool, config *tls.Config) {
+func (r *rabbitMQConn) reconnect(secure bool, config *amqp.Config) {
 	// skip first connect
 	var connect bool
 
@@ -123,7 +142,7 @@ func (r *rabbitMQConn) reconnect(secure bool, config *tls.Config) {
 	}
 }
 
-func (r *rabbitMQConn) Connect(secure bool, config *tls.Config) error {
+func (r *rabbitMQConn) Connect(secure bool, config *amqp.Config) error {
 	r.Lock()
 
 	// already connected
@@ -161,21 +180,26 @@ func (r *rabbitMQConn) Close() error {
 	return r.Connection.Close()
 }
 
-func (r *rabbitMQConn) tryConnect(secure bool, config *tls.Config) error {
+func (r *rabbitMQConn) tryConnect(secure bool, config *amqp.Config) error {
 	var err error
 
-	if secure || config != nil || strings.HasPrefix(r.url, "amqps://") {
-		if config == nil {
-			config = &tls.Config{
+	if config == nil {
+		config = &defaultAmqpConfig
+	}
+
+	url := r.url
+
+	if secure || config.TLSClientConfig != nil || strings.HasPrefix(r.url, "amqps://") {
+		if config.TLSClientConfig == nil {
+			config.TLSClientConfig = &tls.Config{
 				InsecureSkipVerify: true,
 			}
 		}
 
-		url := strings.Replace(r.url, "amqp://", "amqps://", 1)
-		r.Connection, err = dialTLS(url, config)
-	} else {
-		r.Connection, err = dial(r.url)
+		url = strings.Replace(r.url, "amqp://", "amqps://", 1)
 	}
+
+	r.Connection, err = dialConfig(url, *config)
 
 	if err != nil {
 		return err
@@ -185,22 +209,26 @@ func (r *rabbitMQConn) tryConnect(secure bool, config *tls.Config) error {
 		return err
 	}
 
-	r.Channel.DeclareExchange(r.exchange)
+	if r.exchange.durable {
+		r.Channel.DeclareDurableExchange(r.exchange.name)
+	} else {
+		r.Channel.DeclareExchange(r.exchange.name)
+	}
 	r.ExchangeChannel, err = newRabbitChannel(r.Connection, r.prefetchCount, r.prefetchGlobal)
 
 	return err
 }
 
-func (r *rabbitMQConn) Consume(queue, key string, headers amqp.Table, autoAck, durableQueue bool) (*rabbitMQChannel, <-chan amqp.Delivery, error) {
+func (r *rabbitMQConn) Consume(queue, key string, headers amqp.Table, qArgs amqp.Table, autoAck, durableQueue bool) (*rabbitMQChannel, <-chan amqp.Delivery, error) {
 	consumerChannel, err := newRabbitChannel(r.Connection, r.prefetchCount, r.prefetchGlobal)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if durableQueue {
-		err = consumerChannel.DeclareDurableQueue(queue)
+		err = consumerChannel.DeclareDurableQueue(queue, qArgs)
 	} else {
-		err = consumerChannel.DeclareQueue(queue)
+		err = consumerChannel.DeclareQueue(queue, qArgs)
 	}
 
 	if err != nil {
@@ -212,7 +240,7 @@ func (r *rabbitMQConn) Consume(queue, key string, headers amqp.Table, autoAck, d
 		return nil, nil, err
 	}
 
-	err = consumerChannel.BindQueue(queue, key, r.exchange, headers)
+	err = consumerChannel.BindQueue(queue, key, r.exchange.name, headers)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/micro/go-log"
+	log "github.com/micro/go-log"
 	"github.com/micro/go-micro/broker"
 	"github.com/micro/go-micro/cmd"
 	"github.com/micro/go-micro/codec"
@@ -66,7 +66,8 @@ func init() {
 func newGRPCServer(opts ...server.Option) server.Server {
 	options := newOptions(opts...)
 
-	gsrv := &grpcServer{
+	// create a grpc server
+	srv := &grpcServer{
 		opts: options,
 		rpc: &rServer{
 			serviceMap: make(map[string]*service),
@@ -76,21 +77,39 @@ func newGRPCServer(opts ...server.Option) server.Server {
 		exit:        make(chan chan error),
 	}
 
-	maxMsgSize := gsrv.getMaxMsgSize()
+	// configure the grpc server
+	srv.configure()
+
+	return srv
+}
+
+func (g *grpcServer) configure(opts ...server.Option) {
+	// Don't reprocess where there's no config
+	if len(opts) == 0 && g.srv != nil {
+		return
+	}
+
+	for _, o := range opts {
+		o(&g.opts)
+	}
+
+	maxMsgSize := g.getMaxMsgSize()
 
 	gopts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(maxMsgSize),
 		grpc.MaxSendMsgSize(maxMsgSize),
-		grpc.UnknownServiceHandler(gsrv.handler),
+		grpc.UnknownServiceHandler(g.handler),
 	}
 
-	if creds := gsrv.getCredentials(); creds != nil {
+	if creds := g.getCredentials(); creds != nil {
 		gopts = append(gopts, grpc.Creds(creds))
 	}
 
-	// set grpc service
-	gsrv.srv = grpc.NewServer(gopts...)
-	return gsrv
+	if opts := g.getGrpcOptions(); opts != nil {
+		gopts = append(gopts, opts...)
+	}
+
+	g.srv = grpc.NewServer(gopts...)
 }
 
 func (g *grpcServer) getMaxMsgSize() int {
@@ -112,6 +131,26 @@ func (g *grpcServer) getCredentials() credentials.TransportCredentials {
 		}
 	}
 	return nil
+}
+
+func (g *grpcServer) getGrpcOptions() []grpc.ServerOption {
+	if g.opts.Context == nil {
+		return nil
+	}
+
+	v := g.opts.Context.Value(grpcOptions{})
+
+	if v == nil {
+		return nil
+	}
+
+	opts, ok := v.([]grpc.ServerOption)
+
+	if !ok {
+		return nil
+	}
+
+	return opts
 }
 
 func (g *grpcServer) handler(srv interface{}, stream grpc.ServerStream) error {
@@ -221,6 +260,7 @@ func (g *grpcServer) processRequest(stream grpc.ServerStream, service *service, 
 			contentType: ct,
 			method:      fmt.Sprintf("%s.%s", service.name, mtype.method.Name),
 			body:        b,
+			payload:     argv.Interface(),
 		}
 
 		// define the handler func
@@ -332,9 +372,7 @@ func (g *grpcServer) Options() server.Options {
 }
 
 func (g *grpcServer) Init(opts ...server.Option) error {
-	for _, opt := range opts {
-		opt(&g.opts)
-	}
+	g.configure(opts...)
 	return nil
 }
 
@@ -580,12 +618,55 @@ func (g *grpcServer) Start() error {
 	g.opts.Address = ts.Addr().String()
 	g.Unlock()
 
+	// connect to the broker
+	if err := config.Broker.Connect(); err != nil {
+		return err
+	}
+
+	log.Logf("Broker [%s] Listening on %s", config.Broker.String(), config.Broker.Address())
+
+	// announce self to the world
+	if err := g.Register(); err != nil {
+		log.Log("Server register error: ", err)
+	}
+
 	// micro: go ts.Accept(s.accept)
-	go g.srv.Serve(ts)
+	go func() {
+		if err := g.srv.Serve(ts); err != nil {
+			log.Log("gRPC Server start error: ", err)
+		}
+	}()
 
 	go func() {
-		// wait for exit
-		ch := <-g.exit
+		t := new(time.Ticker)
+
+		// only process if it exists
+		if g.opts.RegisterInterval > time.Duration(0) {
+			// new ticker
+			t = time.NewTicker(g.opts.RegisterInterval)
+		}
+
+		// return error chan
+		var ch chan error
+
+	Loop:
+		for {
+			select {
+			// register self on interval
+			case <-t.C:
+				if err := g.Register(); err != nil {
+					log.Log("Server register error: ", err)
+				}
+			// wait for exit
+			case ch = <-g.exit:
+				break Loop
+			}
+		}
+
+		// deregister self
+		if err := g.Deregister(); err != nil {
+			log.Log("Server deregister error: ", err)
+		}
 
 		// wait for waitgroup
 		if wait(g.opts.Context) {
@@ -602,7 +683,7 @@ func (g *grpcServer) Start() error {
 		config.Broker.Disconnect()
 	}()
 
-	return config.Broker.Connect()
+	return nil
 }
 
 func (g *grpcServer) Stop() error {
